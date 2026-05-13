@@ -142,12 +142,14 @@ namespace vks
 		PFN_vkCmdBeginDebugUtilsLabelEXT vkCmdBeginDebugUtilsLabelEXT{ nullptr };
 		PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT{ nullptr };
 		PFN_vkCmdInsertDebugUtilsLabelEXT vkCmdInsertDebugUtilsLabelEXT{ nullptr };
+		PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT{ nullptr };
 
 		void setup(VkInstance instance)
 		{
 			vkCmdBeginDebugUtilsLabelEXT = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(vkGetInstanceProcAddr(instance, "vkCmdBeginDebugUtilsLabelEXT"));
 			vkCmdEndDebugUtilsLabelEXT = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(vkGetInstanceProcAddr(instance, "vkCmdEndDebugUtilsLabelEXT"));
 			vkCmdInsertDebugUtilsLabelEXT = reinterpret_cast<PFN_vkCmdInsertDebugUtilsLabelEXT>(vkGetInstanceProcAddr(instance, "vkCmdInsertDebugUtilsLabelEXT"));
+			vkSetDebugUtilsObjectNameEXT = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(vkGetInstanceProcAddr(instance, "vkSetDebugUtilsObjectNameEXT"));
 		}
 
 		void cmdBeginLabel(VkCommandBuffer cmdbuffer, std::string caption, glm::vec4 color)
@@ -168,6 +170,64 @@ namespace vks
 				return;
 			}
 			vkCmdEndDebugUtilsLabelEXT(cmdbuffer);
+		}
+
+		void cmdInsertLabel(VkCommandBuffer cmdbuffer, std::string caption, glm::vec4 color)
+		{
+			if (!vkCmdInsertDebugUtilsLabelEXT) {
+				return;
+			}
+			VkDebugUtilsLabelEXT labelInfo{};
+			labelInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+			labelInfo.pLabelName = caption.c_str();
+			memcpy(labelInfo.color, &color[0], sizeof(float) * 4);
+			vkCmdInsertDebugUtilsLabelEXT(cmdbuffer, &labelInfo);
+		}
+
+		void setObjectName(VkDevice device, VkObjectType objectType, uint64_t objectHandle, std::string objectName)
+		{
+			if (!vkSetDebugUtilsObjectNameEXT) {
+				return;
+			}
+			VkDebugUtilsObjectNameInfoEXT nameInfo = { VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+			nameInfo.objectType = objectType;
+			nameInfo.objectHandle = objectHandle;
+			nameInfo.pObjectName = objectName.c_str();
+			vkSetDebugUtilsObjectNameEXT(device, &nameInfo);
+		}
+
+		void cmdBeginLabel(VkCommandBuffer cmdbuffer, const char* caption)
+		{
+			if (!vkCmdBeginDebugUtilsLabelEXT) {
+				return;
+			}
+			VkDebugUtilsLabelEXT labelInfo{};
+			labelInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+			labelInfo.pLabelName = caption;
+			vkCmdBeginDebugUtilsLabelEXT(cmdbuffer, &labelInfo);
+		}
+
+		void cmdInsertLabel(VkCommandBuffer cmdbuffer, const char* caption)
+		{
+			if (!vkCmdInsertDebugUtilsLabelEXT) {
+				return;
+			}
+			VkDebugUtilsLabelEXT labelInfo{};
+			labelInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+			labelInfo.pLabelName = caption;
+			vkCmdInsertDebugUtilsLabelEXT(cmdbuffer, &labelInfo);
+		}
+
+		void setObjectName(VkDevice device, VkObjectType objectType, uint64_t objectHandle, const char* objectName)
+		{
+			if (!vkSetDebugUtilsObjectNameEXT) {
+				return;
+			}
+			VkDebugUtilsObjectNameInfoEXT nameInfo = { VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+			nameInfo.objectType = objectType;
+			nameInfo.objectHandle = objectHandle;
+			nameInfo.pObjectName = objectName;
+			vkSetDebugUtilsObjectNameEXT(device, &nameInfo);
 		}
 
 	};

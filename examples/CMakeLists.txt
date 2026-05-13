@@ -72,6 +72,8 @@ function(buildExample EXAMPLE_NAME)
 			target_include_directories(${EXAMPLE_NAME} PRIVATE ${OpenMP_CXX_INCLUDE_DIRS})
 			target_link_libraries(${EXAMPLE_NAME} ${OpenMP_CXX_LIBRARIES})
 		endif()
+	elseif(${EXAMPLE_NAME} STREQUAL "meshlets")
+		target_link_libraries(${EXAMPLE_NAME} meshoptimizer)
 	endif()
 
 	if(RESOURCE_INSTALL_DIR)
@@ -128,6 +130,7 @@ set(EXAMPLES
 	inlineuniformblocks
 	inputattachments
 	instancing
+	meshlets
 	meshshader
 	multisampling
 	multisamplingalphatocoverage

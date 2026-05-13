@@ -60,5 +60,11 @@ namespace vks
 		void setup(VkInstance instance);
 		void cmdBeginLabel(VkCommandBuffer cmdbuffer, std::string caption, glm::vec4 color);
 		void cmdEndLabel(VkCommandBuffer cmdbuffer);
+		void cmdInsertLabel(VkCommandBuffer cmdbuffer, std::string caption, glm::vec4 color);
+		void setObjectName(VkDevice device, VkObjectType objectType, uint64_t objectHandle, std::string objectName);
+
+		void cmdBeginLabel(VkCommandBuffer cmdbuffer, const char* caption);
+		void cmdInsertLabel(VkCommandBuffer cmdbuffer, const char* caption);
+		void setObjectName(VkDevice device, VkObjectType objectType, uint64_t objectHandle, const char* objectName);
 	}
 }

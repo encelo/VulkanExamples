@@ -24,6 +24,7 @@ CMakeScripts
 Makefile
 cmake_install.cmake
 install_manifest.txt
+CMakeUserPresets.json
 
 # Roslyn cache directories
 *.ide/
@@ -241,5 +242,6 @@ android/.idea/**
 libs/vulkan/*.so
 
 .vscode/*
+.qtcreator
 
 __pycache__**
