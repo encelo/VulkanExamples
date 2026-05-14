@@ -17,6 +17,8 @@
  * If you are looking for a complete glTF implementation, check out https://github.com/SaschaWillems/Vulkan-glTF-PBR/
  */
 
+#include <queue>
+
 #define TINYGLTF_IMPLEMENTATION
 #define STB_IMAGE_IMPLEMENTATION
 #define TINYGLTF_NO_STB_IMAGE_WRITE
@@ -24,8 +26,26 @@
 	#define TINYGLTF_ANDROID_LOAD_FROM_ASSETS
 #endif
 #include "tiny_gltf.h"
+#include "meshoptimizer.h"
 
+#include "VulkanDebug.h"
 #include "vulkanexamplebase.h"
+
+namespace {
+
+enum class DrawMode : int32_t
+{
+	DRAW_INDEXED,
+	DRAW_INDEXED_MESHLETS
+};
+
+int32_t selectedDrawModeGUI = int32_t(DrawMode::DRAW_INDEXED_MESHLETS);
+const char *drawModeItemsGUI = "Indexed\0Indexed Meshlets\0\0";
+
+float meshletsToRenderGUI = 1.0f;
+size_t renderedMeshletsCounterGUI = 0;
+
+}
 
 // Contains everything required to render a glTF model in Vulkan
 // This class is heavily simplified (compared to glTF's feature set) but retains the basic glTF structure
@@ -41,8 +61,6 @@ class VulkanglTFModel
 	{
 		glm::vec3 pos;
 		glm::vec3 normal;
-		glm::vec2 uv;
-		glm::vec3 color;
 	};
 
 	// Single vertex buffer for all primitives
@@ -60,16 +78,30 @@ class VulkanglTFModel
 		VkDeviceMemory memory;
 	} indices;
 
+	// Single index buffer for all meshlets
+	struct
+	{
+		int count;
+		VkBuffer buffer;
+		VkDeviceMemory memory;
+	} meshletIndices;
+
 	// The following structures roughly represent the glTF scene structure
 	// To keep things simple, they only contain those properties that are required for this sample
 	struct Node;
+
+	struct Meshlet
+	{
+		uint32_t firstIndex;
+		uint32_t indexCount;
+	};
 
 	// A primitive contains the data for a single draw call
 	struct Primitive
 	{
 		uint32_t firstIndex;
 		uint32_t indexCount;
-		int32_t materialIndex;
+		std::vector<Meshlet> meshlets;
 	};
 
 	// Contains the node's (optional) geometry and can be made up of an arbitrary number of primitives
@@ -92,35 +124,9 @@ class VulkanglTFModel
 		}
 	};
 
-	// A glTF material stores information in e.g. the texture that is attached to it and colors
-	struct Material
-	{
-		glm::vec4 baseColorFactor = glm::vec4(1.0f);
-		uint32_t baseColorTextureIndex;
-	};
-
-	// Contains the texture for a single glTF image
-	// Images may be reused by texture objects and are as such separated
-	struct Image
-	{
-		vks::Texture2D texture;
-		// We also store (and create) a descriptor set that's used to access this texture from the fragment shader
-		VkDescriptorSet descriptorSet;
-	};
-
-	// A glTF texture stores a reference to the image and a sampler
-	// In this sample, we are only interested in the image
-	struct Texture
-	{
-		int32_t imageIndex;
-	};
-
 	/*
 		Model data
 	*/
-	std::vector<Image> images;
-	std::vector<Texture> textures;
-	std::vector<Material> materials;
 	std::vector<Node *> nodes;
 
 	~VulkanglTFModel()
@@ -134,13 +140,8 @@ class VulkanglTFModel
 		vkFreeMemory(vulkanDevice->logicalDevice, vertices.memory, nullptr);
 		vkDestroyBuffer(vulkanDevice->logicalDevice, indices.buffer, nullptr);
 		vkFreeMemory(vulkanDevice->logicalDevice, indices.memory, nullptr);
-		for (Image image : images)
-		{
-			vkDestroyImageView(vulkanDevice->logicalDevice, image.texture.view, nullptr);
-			vkDestroyImage(vulkanDevice->logicalDevice, image.texture.image, nullptr);
-			vkDestroySampler(vulkanDevice->logicalDevice, image.texture.sampler, nullptr);
-			vkFreeMemory(vulkanDevice->logicalDevice, image.texture.deviceMemory, nullptr);
-		}
+		vkDestroyBuffer(vulkanDevice->logicalDevice, meshletIndices.buffer, nullptr);
+		vkFreeMemory(vulkanDevice->logicalDevice, meshletIndices.memory, nullptr);
 	}
 
 	/*
@@ -148,68 +149,6 @@ class VulkanglTFModel
 
 		The following functions take a glTF input model loaded via tinyglTF and convert all required data into our own structure
 	*/
-
-	void loadImages(tinygltf::Model &input)
-	{
-		// Images can be stored inside the glTF (which is the case for the sample model), so instead of directly
-		// loading them from disk, we fetch them from the glTF loader and upload the buffers
-		images.resize(input.images.size());
-		for (size_t i = 0; i < input.images.size(); i++)
-		{
-			tinygltf::Image &glTFImage = input.images[i];
-			// Get the image data from the glTF loader
-			unsigned char *buffer = nullptr;
-			VkDeviceSize bufferSize = 0;
-			bool deleteBuffer = false;
-			// We convert RGB-only images to RGBA, as most devices don't support RGB-formats in Vulkan
-			if (glTFImage.component == 3)
-			{
-				bufferSize = glTFImage.width * glTFImage.height * 4;
-				buffer = new unsigned char[bufferSize];
-				unsigned char *rgba = buffer;
-				unsigned char *rgb = &glTFImage.image[0];
-				for (size_t i = 0; i < glTFImage.width * glTFImage.height; ++i)
-				{
-					memcpy(rgba, rgb, sizeof(unsigned char) * 3);
-					rgba += 4;
-					rgb += 3;
-				}
-				deleteBuffer = true;
-			}
-			else
-			{
-				buffer = &glTFImage.image[0];
-				bufferSize = glTFImage.image.size();
-			}
-			// Load texture from image buffer
-			images[i].texture.fromBuffer(buffer, bufferSize, VK_FORMAT_R8G8B8A8_UNORM, glTFImage.width, glTFImage.height, vulkanDevice, copyQueue);
-			if (deleteBuffer)
-				delete[] buffer;
-		}
-	}
-
-	void loadTextures(tinygltf::Model &input)
-	{
-		textures.resize(input.textures.size());
-		for (size_t i = 0; i < input.textures.size(); i++)
-			textures[i].imageIndex = input.textures[i].source;
-	}
-
-	void loadMaterials(tinygltf::Model &input)
-	{
-		materials.resize(input.materials.size());
-		for (size_t i = 0; i < input.materials.size(); i++)
-		{
-			// We only read the most basic properties required for our sample
-			tinygltf::Material glTFMaterial = input.materials[i];
-			// Get the base color factor
-			if (glTFMaterial.values.find("baseColorFactor") != glTFMaterial.values.end())
-				materials[i].baseColorFactor = glm::make_vec4(glTFMaterial.values["baseColorFactor"].ColorFactor().data());
-			// Get base color texture index
-			if (glTFMaterial.values.find("baseColorTexture") != glTFMaterial.values.end())
-				materials[i].baseColorTextureIndex = glTFMaterial.values["baseColorTexture"].TextureIndex();
-		}
-	}
 
 	void loadNode(const tinygltf::Node &inputNode, const tinygltf::Model &input, VulkanglTFModel::Node *parent, std::vector<uint32_t> &indexBuffer, std::vector<VulkanglTFModel::Vertex> &vertexBuffer)
 	{
@@ -254,7 +193,6 @@ class VulkanglTFModel
 				{
 					const float *positionBuffer = nullptr;
 					const float *normalsBuffer = nullptr;
-					const float *texCoordsBuffer = nullptr;
 					size_t vertexCount = 0;
 
 					// Get buffer data for vertex positions
@@ -272,23 +210,12 @@ class VulkanglTFModel
 						const tinygltf::BufferView &view = input.bufferViews[accessor.bufferView];
 						normalsBuffer = reinterpret_cast<const float *>(&(input.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
 					}
-					// Get buffer data for vertex texture coordinates
-					// glTF supports multiple sets, we only load the first one
-					if (glTFPrimitive.attributes.find("TEXCOORD_0") != glTFPrimitive.attributes.end())
-					{
-						const tinygltf::Accessor &accessor = input.accessors[glTFPrimitive.attributes.find("TEXCOORD_0")->second];
-						const tinygltf::BufferView &view = input.bufferViews[accessor.bufferView];
-						texCoordsBuffer = reinterpret_cast<const float *>(&(input.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
-					}
-
 					// Append data to model's vertex buffer
 					for (size_t v = 0; v < vertexCount; v++)
 					{
 						Vertex vert{
 							.pos = glm::vec4(glm::make_vec3(&positionBuffer[v * 3]), 1.0f),
-							.normal = glm::normalize(glm::vec3(normalsBuffer ? glm::make_vec3(&normalsBuffer[v * 3]) : glm::vec3(0.0f))),
-							.uv = texCoordsBuffer ? glm::make_vec2(&texCoordsBuffer[v * 2]) : glm::vec3(0.0f),
-							.color = glm::vec3(1.0f),
+							.normal = glm::normalize(glm::vec3(normalsBuffer ? glm::make_vec3(&normalsBuffer[v * 3]) : glm::vec3(0.0f)))
 						};
 						vertexBuffer.push_back(vert);
 					}
@@ -333,7 +260,6 @@ class VulkanglTFModel
 				Primitive primitive{
 					.firstIndex = firstIndex,
 					.indexCount = indexCount,
-					.materialIndex = glTFPrimitive.material
 				};
 				node->mesh.primitives.push_back(primitive);
 			}
@@ -365,16 +291,26 @@ class VulkanglTFModel
 			}
 			// Pass the final matrix to the vertex shader using push constants
 			vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &nodeMatrix);
+
 			for (VulkanglTFModel::Primitive &primitive : node->mesh.primitives)
 			{
-				if (primitive.indexCount > 0)
+				vks::debugutils::cmdBeginLabel(commandBuffer, "Primitive");
+				if (selectedDrawModeGUI == int32_t(DrawMode::DRAW_INDEXED))
 				{
-					// Get the texture index for this primitive
-					VulkanglTFModel::Texture texture = textures[materials[primitive.materialIndex].baseColorTextureIndex];
-					// Bind the descriptor for the current primitive's texture
-					vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 1, 1, &images[texture.imageIndex].descriptorSet, 0, nullptr);
-					vkCmdDrawIndexed(commandBuffer, primitive.indexCount, 1, primitive.firstIndex, 0, 0);
+					if (primitive.indexCount > 0)
+						vkCmdDrawIndexed(commandBuffer, primitive.indexCount, 1, primitive.firstIndex, 0, 0);
 				}
+				else if (selectedDrawModeGUI == int32_t(DrawMode::DRAW_INDEXED_MESHLETS))
+				{
+					const size_t numMeshlets = primitive.meshlets.size() * meshletsToRenderGUI;
+					for (size_t meshletIdx = 0; meshletIdx < numMeshlets; meshletIdx++)
+					{
+						const Meshlet &meshlet = primitive.meshlets[meshletIdx];
+						vkCmdDrawIndexed(commandBuffer, meshlet.indexCount, 1, meshlet.firstIndex, 0, 0);
+					}
+					renderedMeshletsCounterGUI += numMeshlets;
+				}
+				vks::debugutils::cmdEndLabel(commandBuffer);
 			}
 		}
 		for (auto &child : node->children)
@@ -384,10 +320,15 @@ class VulkanglTFModel
 	// Draw the glTF scene starting at the top-level-nodes
 	void draw(VkCommandBuffer commandBuffer, VkPipelineLayout pipelineLayout)
 	{
+		renderedMeshletsCounterGUI = 0;
+
 		// All vertices and indices are stored in single buffers, so we only need to bind once
 		VkDeviceSize offsets[1] = { 0 };
 		vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertices.buffer, offsets);
-		vkCmdBindIndexBuffer(commandBuffer, indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+		if (selectedDrawModeGUI == int32_t(DrawMode::DRAW_INDEXED))
+			vkCmdBindIndexBuffer(commandBuffer, indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+		else
+			vkCmdBindIndexBuffer(commandBuffer, meshletIndices.buffer, 0, VK_INDEX_TYPE_UINT32);
 		// Render all nodes at top-level
 		for (auto &node : nodes)
 			drawNode(commandBuffer, pipelineLayout, node);
@@ -404,7 +345,7 @@ class VulkanExample : public VulkanExampleBase
 	struct UniformData
 	{
 		glm::mat4 projection;
-		glm::mat4 model;
+		glm::mat4 view;
 		glm::vec4 lightPos = glm::vec4(5.0f, 5.0f, -5.0f, 1.0f);
 		glm::vec4 viewPos;
 	} uniformData;
@@ -420,13 +361,12 @@ class VulkanExample : public VulkanExampleBase
 	struct DescriptorSetLayouts
 	{
 		VkDescriptorSetLayout matrices{ VK_NULL_HANDLE };
-		VkDescriptorSetLayout textures{ VK_NULL_HANDLE };
 	} descriptorSetLayouts;
 	std::array<VkDescriptorSet, maxConcurrentFrames> descriptorSets{};
 
 	VulkanExample() : VulkanExampleBase()
 	{
-		title = "glTF model rendering";
+		title = "Indirect meshlets rendering";
 		camera.type = Camera::CameraType::lookat;
 		camera.flipY = true;
 		camera.setPosition(glm::vec3(0.0f, -0.1f, -1.0f));
@@ -443,7 +383,6 @@ class VulkanExample : public VulkanExampleBase
 				vkDestroyPipeline(device, pipelines.wireframe, nullptr);
 			vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
 			vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.matrices, nullptr);
-			vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.textures, nullptr);
 			for (auto &buffer : uniformBuffers)
 				buffer.destroy();
 		}
@@ -480,9 +419,6 @@ class VulkanExample : public VulkanExampleBase
 
 		if (fileLoaded)
 		{
-			glTFModel.loadImages(glTFInput);
-			glTFModel.loadMaterials(glTFInput);
-			glTFModel.loadTextures(glTFInput);
 			const tinygltf::Scene &scene = glTFInput.scenes[0];
 			for (size_t i = 0; i < scene.nodes.size(); i++)
 			{
@@ -503,6 +439,76 @@ class VulkanExample : public VulkanExampleBase
 		size_t vertexBufferSize = vertexBuffer.size() * sizeof(VulkanglTFModel::Vertex);
 		size_t indexBufferSize = indexBuffer.size() * sizeof(uint32_t);
 		glTFModel.indices.count = static_cast<uint32_t>(indexBuffer.size());
+
+		// ----- Build meshlets data -----
+
+		std::vector<uint32_t> meshletIndices;
+		meshletIndices.reserve(indexBuffer.size());
+		size_t meshletIndexBufferSize = 0;
+		for (uint32_t nodeIdx = 0; nodeIdx < glTFModel.nodes.size(); nodeIdx++)
+		{
+			std::queue<VulkanglTFModel::Node *> nodesToVisit;
+			nodesToVisit.push(glTFModel.nodes[nodeIdx]);
+
+			while (nodesToVisit.empty() == false)
+			{
+				VulkanglTFModel::Node *node = nodesToVisit.front();
+				nodesToVisit.pop();
+				for (uint32_t childIdx = 0; childIdx < node->children.size(); childIdx++)
+					nodesToVisit.push(node->children[childIdx]);
+
+				for (uint32_t primitiveIdx = 0; primitiveIdx < node->mesh.primitives.size(); primitiveIdx++)
+				{
+					VulkanglTFModel::Primitive &primitive = node->mesh.primitives[primitiveIdx];
+					const size_t MaxVertices = 64;
+					const size_t MaxTriangles = 126;
+					const float ConeWeight = 0.0f;
+
+					size_t maxMeshlets = meshopt_buildMeshletsBound(primitive.indexCount, MaxVertices, MaxTriangles);
+					std::vector<meshopt_Meshlet> meshlets(maxMeshlets);
+					std::vector<unsigned int> meshletVertices(maxMeshlets * MaxVertices);
+					std::vector<unsigned char> meshletTriangles(maxMeshlets * MaxTriangles * 3);
+
+					const size_t meshletCount = meshopt_buildMeshlets(meshlets.data(), meshletVertices.data(), meshletTriangles.data(), indexBuffer.data() + primitive.firstIndex,
+						primitive.indexCount, &vertexBuffer[0].pos.x, vertexBuffer.size(), sizeof(VulkanglTFModel::Vertex), MaxVertices, MaxTriangles, ConeWeight);
+
+					if (meshletCount == 0)
+						continue;
+					// Trimming meshlet data vectors
+					const meshopt_Meshlet &last = meshlets[meshletCount - 1];
+					meshletVertices.resize(last.vertex_offset + last.vertex_count);
+					meshletTriangles.resize(last.triangle_offset + last.triangle_count * 3);
+					meshlets.resize(meshletCount);
+
+					primitive.meshlets.reserve(meshlets.size());
+					for (uint32_t meshletIdx = 0; meshletIdx < meshlets.size(); meshletIdx++)
+					{
+						const meshopt_Meshlet &m = meshlets[meshletIdx];
+						meshopt_optimizeMeshlet(&meshletVertices[m.vertex_offset], &meshletTriangles[m.triangle_offset], m.triangle_count, m.vertex_count);
+
+						VulkanglTFModel::Meshlet meshlet;
+						meshlet.firstIndex = static_cast<uint32_t>(meshletIndices.size());
+						meshlet.indexCount = m.triangle_count * 3;
+						primitive.meshlets.push_back(meshlet);
+
+						for (uint32_t triangleIdx = 0; triangleIdx < m.triangle_count; triangleIdx++)
+						{
+							for (uint32_t vertexIdx = 0; vertexIdx < 3; vertexIdx++)
+							{
+								const uint32_t localIndex = meshletTriangles[m.triangle_offset + triangleIdx * 3 + vertexIdx];
+								const uint32_t absVertexIndex = meshletVertices[m.vertex_offset + localIndex];
+								meshletIndices.push_back(absVertexIndex);
+							}
+						}
+
+						meshletIndexBufferSize += meshlet.indexCount * sizeof(uint32_t);
+						glTFModel.meshletIndices.count += static_cast<uint32_t>(meshlet.indexCount);
+					}
+				}
+			}
+		}
+
+		// ------------------
 
 		vks::Buffer vertexStaging, indexStaging;
 
@@ -528,12 +534,33 @@ class VulkanExample : public VulkanExampleBase
 		    vertexBufferSize,
 		    &glTFModel.vertices.buffer,
 		    &glTFModel.vertices.memory));
+		vks::debugutils::setObjectName(vulkanDevice->logicalDevice, VK_OBJECT_TYPE_BUFFER, uint64_t(glTFModel.vertices.buffer), "Vertex buffer");
 		VK_CHECK_RESULT(vulkanDevice->createBuffer(
 		    VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 		    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 		    indexBufferSize,
 		    &glTFModel.indices.buffer,
 		    &glTFModel.indices.memory));
+		vks::debugutils::setObjectName(vulkanDevice->logicalDevice, VK_OBJECT_TYPE_BUFFER, uint64_t(glTFModel.indices.buffer), "Index buffer");
+
+		// ----- Meshlet indices -----
+		vks::Buffer meshletIndexStaging;
+
+		VK_CHECK_RESULT(vulkanDevice->createBuffer(
+		    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		    &meshletIndexStaging,
+		    meshletIndexBufferSize,
+		    meshletIndices.data()));
+
+		VK_CHECK_RESULT(vulkanDevice->createBuffer(
+		    VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		    meshletIndexBufferSize,
+		    &glTFModel.meshletIndices.buffer,
+		    &glTFModel.meshletIndices.memory));
+		vks::debugutils::setObjectName(vulkanDevice->logicalDevice, VK_OBJECT_TYPE_BUFFER, uint64_t(glTFModel.meshletIndices.buffer), "Meshlet index buffer");
+
 
 		// Copy data from staging buffers (host) do device local buffer (gpu)
 		VkCommandBuffer copyCmd = vulkanDevice->createCommandBuffer(VK_COMMAND_BUFFER_LEVEL_PRIMARY, true);
@@ -555,10 +582,20 @@ class VulkanExample : public VulkanExampleBase
 		    1,
 		    &copyRegion);
 
+		copyRegion.size = meshletIndexBufferSize;
+		vkCmdCopyBuffer(
+		    copyCmd,
+		    meshletIndexStaging.buffer,
+		    glTFModel.meshletIndices.buffer,
+		    1,
+		    &copyRegion);
+
 		vulkanDevice->flushCommandBuffer(copyCmd, queue, true);
 
 		vertexStaging.destroy();
 		indexStaging.destroy();
+
+		meshletIndexStaging.destroy();
 	}
 
 	void loadAssets()
@@ -569,16 +606,14 @@ class VulkanExample : public VulkanExampleBase
 	void setupDescriptors()
 	{
 		/*
-			This sample uses separate descriptor sets (and layouts) for the matrices and materials (textures)
+			This sample uses separate descriptor sets (and layouts) for the matrices
 		*/
 
 		std::vector<VkDescriptorPoolSize> poolSizes = {
-			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, maxConcurrentFrames),
-			// One combined image sampler per model image/texture
-			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<uint32_t>(glTFModel.images.size()) * maxConcurrentFrames),
+			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, maxConcurrentFrames)
 		};
-		// One set for matrices and one per model image/texture
-		const uint32_t maxSetCount = (static_cast<uint32_t>(glTFModel.images.size()) + 1) * maxConcurrentFrames;
+		// One set for matrices
+		const uint32_t maxSetCount = 1 * maxConcurrentFrames;
 		VkDescriptorPoolCreateInfo descriptorPoolInfo = vks::initializers::descriptorPoolCreateInfo(poolSizes, maxSetCount);
 		VK_CHECK_RESULT(vkCreateDescriptorPool(device, &descriptorPoolInfo, nullptr, &descriptorPool));
 
@@ -586,9 +621,6 @@ class VulkanExample : public VulkanExampleBase
 		VkDescriptorSetLayoutBinding setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 0);
 		VkDescriptorSetLayoutCreateInfo descriptorSetLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(&setLayoutBinding, 1);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.matrices));
-		// Descriptor set layout for passing material textures
-		setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 0);
-		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.textures));
 
 		// Descriptor set for scene matrices per frame, just like the buffers themselves
 		for (auto i = 0; i < uniformBuffers.size(); i++)
@@ -598,23 +630,14 @@ class VulkanExample : public VulkanExampleBase
 			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(descriptorSets[i], VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, &uniformBuffers[i].descriptor);
 			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
 		}
-
-		// Descriptor sets for materials, since they only use static images, no need to duplicate them per frame
-		for (auto &image : glTFModel.images)
-		{
-			const VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.textures, 1);
-			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &image.descriptorSet));
-			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(image.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &image.texture.descriptor);
-			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
-		}
 	}
 
 	void preparePipelines()
 	{
 		// We will use push constants to push the local matrices of a primitive to the vertex shader
 		VkPushConstantRange pushConstantRange = vks::initializers::pushConstantRange(VK_SHADER_STAGE_VERTEX_BIT, sizeof(glm::mat4), 0);
-		// The pipeline layout uses both descriptor sets (set 0 = matrices, set 1 = material)
-		std::array<VkDescriptorSetLayout, 2> setLayouts = { descriptorSetLayouts.matrices, descriptorSetLayouts.textures };
+		// The pipeline layout uses one descriptor set (set 0 = matrices)
+		std::array<VkDescriptorSetLayout, 1> setLayouts = { descriptorSetLayouts.matrices };
 		VkPipelineLayoutCreateInfo pipelineLayoutCI{ //} = vks::initializers::pipelineLayoutCreateInfo(setLayouts.data(), static_cast<uint32_t>(setLayouts.size()));
 			.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 			.setLayoutCount = static_cast<uint32_t>(setLayouts.size()),
@@ -640,9 +663,7 @@ class VulkanExample : public VulkanExampleBase
 		};
 		const std::vector<VkVertexInputAttributeDescription> vertexInputAttributes = {
 			vks::initializers::vertexInputAttributeDescription(0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, pos)), // Location 0: Position
-			vks::initializers::vertexInputAttributeDescription(0, 1, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, normal)), // Location 1: Normal
-			vks::initializers::vertexInputAttributeDescription(0, 2, VK_FORMAT_R32G32_SFLOAT, offsetof(VulkanglTFModel::Vertex, uv)), // Location 2: Texture coordinates
-			vks::initializers::vertexInputAttributeDescription(0, 3, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, color)), // Location 3: Color
+			vks::initializers::vertexInputAttributeDescription(0, 1, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, normal)) // Location 1: Normal
 		};
 		VkPipelineVertexInputStateCreateInfo vertexInputStateCI{
 			.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -698,7 +719,7 @@ class VulkanExample : public VulkanExampleBase
 	void updateUniformBuffers()
 	{
 		uniformData.projection = camera.matrices.perspective;
-		uniformData.model = camera.matrices.view;
+		uniformData.view = camera.matrices.view;
 		uniformData.viewPos = camera.viewPos;
 		memcpy(uniformBuffers[currentBuffer].mapped, &uniformData, sizeof(UniformData));
 	}
@@ -759,12 +780,41 @@ class VulkanExample : public VulkanExampleBase
 		VulkanExampleBase::submitFrame();
 	}
 
+	virtual void keyPressed(uint32_t keyCode)
+	{
+		switch (keyCode)
+		{
+			case KEY_F1:
+				// Counteract default F1 behavior
+				ui.visible = !ui.visible;
+				selectedDrawModeGUI = 0;
+				break;
+			case KEY_F2:
+				selectedDrawModeGUI = 1;
+				break;
+		}
+	}
+
 	virtual void OnUpdateUIOverlay(vks::UIOverlay *overlay)
 	{
-		if (deviceFeatures.fillModeNonSolid)
+		if (overlay->header("Settings"))
 		{
-			if (overlay->header("Settings"))
+			ImGui::PushItemWidth(200.0f);
+			ImGui::Combo("Draw Mode", &selectedDrawModeGUI, drawModeItemsGUI);
+			ImGui::PopItemWidth();
+
+			if (deviceFeatures.fillModeNonSolid)
 				overlay->checkBox("Wireframe", &wireframe);
+
+			if (selectedDrawModeGUI != int32_t(DrawMode::DRAW_INDEXED))
+			{
+				if (meshletsToRenderGUI < 0.0f)
+					meshletsToRenderGUI = 0.0f;
+				else if (meshletsToRenderGUI > 1.0f)
+					meshletsToRenderGUI = 1.0f;
+				ImGui::SliderFloat("Meshlets to Render", &meshletsToRenderGUI, 0.0f, 1.0f, "%.2f");
+				ImGui::Text("Rendered Meshlets: %zu", renderedMeshletsCounterGUI);
+			}
 		}
 	}
 };
