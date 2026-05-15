@@ -36,11 +36,12 @@ namespace {
 enum class DrawMode : int32_t
 {
 	DRAW_INDEXED,
-	DRAW_INDEXED_MESHLETS
+	DRAW_INDEXED_MESHLETS,
+	DRAW_INDIRECT_MESHLETS
 };
 
-int32_t selectedDrawModeGUI = int32_t(DrawMode::DRAW_INDEXED_MESHLETS);
-const char *drawModeItemsGUI = "Indexed\0Indexed Meshlets\0\0";
+int32_t selectedDrawModeGUI = int32_t(DrawMode::DRAW_INDIRECT_MESHLETS);
+const char *drawModeItemsGUI = "Indexed\0Indexed Meshlets\0Indirect Meshlets\0\0";
 
 float meshletsToRenderGUI = 1.0f;
 size_t renderedMeshletsCounterGUI = 0;
@@ -94,6 +95,11 @@ class VulkanglTFModel
 	{
 		uint32_t firstIndex;
 		uint32_t indexCount;
+		float padding0;
+		float padding1;
+
+		glm::vec3 center;
+		float radius;
 	};
 
 	// A primitive contains the data for a single draw call
@@ -101,7 +107,8 @@ class VulkanglTFModel
 	{
 		uint32_t firstIndex;
 		uint32_t indexCount;
-		std::vector<Meshlet> meshlets;
+		uint32_t firstMeshlet;
+		uint32_t meshletCount;
 	};
 
 	// Contains the node's (optional) geometry and can be made up of an arbitrary number of primitives
@@ -109,6 +116,14 @@ class VulkanglTFModel
 	{
 		std::vector<Primitive> primitives;
 	};
+
+	std::vector<Meshlet> allMeshletsData;
+
+	// The buffer containing the meshlet data
+	vks::Buffer allMeshletsDataBuffer;
+
+	// The buffer containing the indirect draw commands
+	vks::Buffer indirectCommandsBuffer;
 
 	// A node represents an object in the glTF scene graph
 	struct Node
@@ -142,6 +157,9 @@ class VulkanglTFModel
 		vkFreeMemory(vulkanDevice->logicalDevice, indices.memory, nullptr);
 		vkDestroyBuffer(vulkanDevice->logicalDevice, meshletIndices.buffer, nullptr);
 		vkFreeMemory(vulkanDevice->logicalDevice, meshletIndices.memory, nullptr);
+
+		indirectCommandsBuffer.destroy();
+		allMeshletsDataBuffer.destroy();
 	}
 
 	/*
@@ -302,12 +320,20 @@ class VulkanglTFModel
 				}
 				else if (selectedDrawModeGUI == int32_t(DrawMode::DRAW_INDEXED_MESHLETS))
 				{
-					const size_t numMeshlets = primitive.meshlets.size() * meshletsToRenderGUI;
+					const size_t numMeshlets = primitive.meshletCount * meshletsToRenderGUI;
 					for (size_t meshletIdx = 0; meshletIdx < numMeshlets; meshletIdx++)
 					{
-						const Meshlet &meshlet = primitive.meshlets[meshletIdx];
+						const Meshlet &meshlet = allMeshletsData[primitive.firstMeshlet + meshletIdx];
 						vkCmdDrawIndexed(commandBuffer, meshlet.indexCount, 1, meshlet.firstIndex, 0, 0);
 					}
+					renderedMeshletsCounterGUI += numMeshlets;
+				}
+				else if (selectedDrawModeGUI == int32_t(DrawMode::DRAW_INDIRECT_MESHLETS))
+				{
+					const size_t numMeshlets = primitive.meshletCount * meshletsToRenderGUI;
+					vkCmdDrawIndexedIndirect(commandBuffer, indirectCommandsBuffer.buffer,
+					                         primitive.firstMeshlet * sizeof(VkDrawIndexedIndirectCommand),
+					                         numMeshlets, sizeof(VkDrawIndexedIndirectCommand));
 					renderedMeshletsCounterGUI += numMeshlets;
 				}
 				vks::debugutils::cmdEndLabel(commandBuffer);
@@ -352,17 +378,21 @@ class VulkanExample : public VulkanExampleBase
 	std::array<vks::Buffer, maxConcurrentFrames> uniformBuffers;
 
 	VkPipelineLayout pipelineLayout{ VK_NULL_HANDLE };
+	VkPipelineLayout pipelineLayoutCompute{ VK_NULL_HANDLE };
 	struct Pipelines
 	{
 		VkPipeline solid{ VK_NULL_HANDLE };
 		VkPipeline wireframe{ VK_NULL_HANDLE };
+		VkPipeline compute{ VK_NULL_HANDLE };
 	} pipelines;
 
 	struct DescriptorSetLayouts
 	{
 		VkDescriptorSetLayout matrices{ VK_NULL_HANDLE };
+		VkDescriptorSetLayout compute{ VK_NULL_HANDLE };
 	} descriptorSetLayouts;
 	std::array<VkDescriptorSet, maxConcurrentFrames> descriptorSets{};
+	VkDescriptorSet computeDescriptorSet{ VK_NULL_HANDLE };
 
 	VulkanExample() : VulkanExampleBase()
 	{
@@ -381,8 +411,11 @@ class VulkanExample : public VulkanExampleBase
 			vkDestroyPipeline(device, pipelines.solid, nullptr);
 			if (pipelines.wireframe != VK_NULL_HANDLE)
 				vkDestroyPipeline(device, pipelines.wireframe, nullptr);
+			vkDestroyPipeline(device, pipelines.compute, nullptr);
 			vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+			vkDestroyPipelineLayout(device, pipelineLayoutCompute, nullptr);
 			vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.matrices, nullptr);
+			vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.compute, nullptr);
 			for (auto &buffer : uniformBuffers)
 				buffer.destroy();
 		}
@@ -393,6 +426,9 @@ class VulkanExample : public VulkanExampleBase
 		// Fill mode non solid is required for wireframe display
 		if (deviceFeatures.fillModeNonSolid)
 			enabledFeatures.fillModeNonSolid = VK_TRUE;
+
+		if (deviceFeatures.multiDrawIndirect)
+			enabledFeatures.multiDrawIndirect = VK_TRUE;
 	}
 
 	void loadglTFFile(std::string filename)
@@ -480,16 +516,24 @@ class VulkanExample : public VulkanExampleBase
 					meshletTriangles.resize(last.triangle_offset + last.triangle_count * 3);
 					meshlets.resize(meshletCount);
 
-					primitive.meshlets.reserve(meshlets.size());
+					primitive.firstMeshlet = glTFModel.allMeshletsData.size();
+					primitive.meshletCount = meshletCount;
 					for (uint32_t meshletIdx = 0; meshletIdx < meshlets.size(); meshletIdx++)
 					{
 						const meshopt_Meshlet &m = meshlets[meshletIdx];
 						meshopt_optimizeMeshlet(&meshletVertices[m.vertex_offset], &meshletTriangles[m.triangle_offset], m.triangle_count, m.vertex_count);
 
+						const meshopt_Bounds bounds = meshopt_computeMeshletBounds(
+							&meshletVertices[m.vertex_offset], &meshletTriangles[m.triangle_offset],
+							m.triangle_count, &vertexBuffer[0].pos.x, vertexBuffer.size(), sizeof(VulkanglTFModel::Vertex));
+
 						VulkanglTFModel::Meshlet meshlet;
 						meshlet.firstIndex = static_cast<uint32_t>(meshletIndices.size());
 						meshlet.indexCount = m.triangle_count * 3;
-						primitive.meshlets.push_back(meshlet);
+						meshlet.center = { bounds.center[0], bounds.center[1], bounds.center[2] };
+						meshlet.radius = bounds.radius;
+						// All meshlets from all primitives of all nodes
+						glTFModel.allMeshletsData.push_back(meshlet);
 
 						for (uint32_t triangleIdx = 0; triangleIdx < m.triangle_count; triangleIdx++)
 						{
@@ -561,6 +605,25 @@ class VulkanExample : public VulkanExampleBase
 		    &glTFModel.meshletIndices.memory));
 		vks::debugutils::setObjectName(vulkanDevice->logicalDevice, VK_OBJECT_TYPE_BUFFER, uint64_t(glTFModel.meshletIndices.buffer), "Meshlet index buffer");
 
+		// ----- Meshlet data from all primitives -----
+		size_t allMeshletsDataBufferSize = glTFModel.allMeshletsData.size() * sizeof(VulkanglTFModel::Meshlet);
+
+		vks::Buffer allMeshletsDataStaging;
+
+		VK_CHECK_RESULT(vulkanDevice->createBuffer(
+		    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		    &allMeshletsDataStaging,
+		    allMeshletsDataBufferSize,
+		    glTFModel.allMeshletsData.data()));
+
+		VK_CHECK_RESULT(vulkanDevice->createBuffer(
+		    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		    &glTFModel.allMeshletsDataBuffer,
+		    allMeshletsDataBufferSize,
+		    nullptr));
+		vks::debugutils::setObjectName(vulkanDevice->logicalDevice, VK_OBJECT_TYPE_BUFFER, uint64_t(glTFModel.allMeshletsDataBuffer.buffer), "Meshlet data buffer");
 
 		// Copy data from staging buffers (host) do device local buffer (gpu)
 		VkCommandBuffer copyCmd = vulkanDevice->createCommandBuffer(VK_COMMAND_BUFFER_LEVEL_PRIMARY, true);
@@ -590,12 +653,21 @@ class VulkanExample : public VulkanExampleBase
 		    1,
 		    &copyRegion);
 
+		copyRegion.size = allMeshletsDataBufferSize;
+		vkCmdCopyBuffer(
+		    copyCmd,
+		    allMeshletsDataStaging.buffer,
+		    glTFModel.allMeshletsDataBuffer.buffer,
+		    1,
+		    &copyRegion);
+
 		vulkanDevice->flushCommandBuffer(copyCmd, queue, true);
 
 		vertexStaging.destroy();
 		indexStaging.destroy();
 
 		meshletIndexStaging.destroy();
+		allMeshletsDataStaging.destroy();
 	}
 
 	void loadAssets()
@@ -610,10 +682,11 @@ class VulkanExample : public VulkanExampleBase
 		*/
 
 		std::vector<VkDescriptorPoolSize> poolSizes = {
-			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, maxConcurrentFrames)
+			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, maxConcurrentFrames),
+			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2)
 		};
-		// One set for matrices
-		const uint32_t maxSetCount = 1 * maxConcurrentFrames;
+		// One set for matrices and one for buffers
+		const uint32_t maxSetCount = maxConcurrentFrames + 2;
 		VkDescriptorPoolCreateInfo descriptorPoolInfo = vks::initializers::descriptorPoolCreateInfo(poolSizes, maxSetCount);
 		VK_CHECK_RESULT(vkCreateDescriptorPool(device, &descriptorPoolInfo, nullptr, &descriptorPool));
 
@@ -630,6 +703,31 @@ class VulkanExample : public VulkanExampleBase
 			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(descriptorSets[i], VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, &uniformBuffers[i].descriptor);
 			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
 		}
+	}
+
+	void setupComputeDescriptors()
+	{
+		// Descriptor set layout for passing storage buffers
+		std::vector<VkDescriptorSetLayoutBinding> setLayoutBindings =
+		{
+			// Binding 0 : Meshlet data
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 0),
+			// Binding 1 : Indirect draw commands
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 1)
+		};
+		VkDescriptorSetLayoutCreateInfo descriptorSetLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(setLayoutBindings);
+		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.compute));
+
+		// Descriptor sets for buffers
+		const VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.compute, 1);
+		VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &computeDescriptorSet));
+
+		std::vector<VkWriteDescriptorSet> writeDescriptorSets;
+		// Binding 0 : Meshlet data
+		writeDescriptorSets.push_back(vks::initializers::writeDescriptorSet(computeDescriptorSet, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, &glTFModel.allMeshletsDataBuffer.descriptor));
+		// Binding 1 : Indirect draw commands
+		writeDescriptorSets.push_back(vks::initializers::writeDescriptorSet(computeDescriptorSet, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, &glTFModel.indirectCommandsBuffer.descriptor));
+		vkUpdateDescriptorSets(device, static_cast<uint32_t>(writeDescriptorSets.size()), writeDescriptorSets.data(), 0, NULL);
 	}
 
 	void preparePipelines()
@@ -706,6 +804,32 @@ class VulkanExample : public VulkanExampleBase
 		}
 	}
 
+	void prepareComputePipeline()
+	{
+		// We will use push constants to push the number of meshlets
+		VkPushConstantRange pushConstantRange = vks::initializers::pushConstantRange(VK_SHADER_STAGE_COMPUTE_BIT, sizeof(uint32_t), 0);
+		// The pipeline layout uses one descriptor set (set 0 = buffers)
+		std::array<VkDescriptorSetLayout, 1> setLayouts = { descriptorSetLayouts.compute };
+		VkPipelineLayoutCreateInfo pipelineLayoutCI{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+			.setLayoutCount = static_cast<uint32_t>(setLayouts.size()),
+			.pSetLayouts = setLayouts.data(),
+			.pushConstantRangeCount = 1,
+			.pPushConstantRanges = &pushConstantRange
+		};
+		VK_CHECK_RESULT(vkCreatePipelineLayout(device, &pipelineLayoutCI, nullptr, &pipelineLayoutCompute));
+
+		VkPipelineShaderStageCreateInfo shaderStage = loadShader(getShadersPath() + "meshlets/indirect.comp.spv", VK_SHADER_STAGE_COMPUTE_BIT);
+
+		VkComputePipelineCreateInfo pipelineCI{
+			.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+			.stage = shaderStage,
+			.layout = pipelineLayoutCompute
+		};
+
+		VK_CHECK_RESULT(vkCreateComputePipelines(device, pipelineCache, 1, &pipelineCI, nullptr, &pipelines.compute));
+	}
+
 	// Prepare and initialize uniform buffer containing shader uniforms
 	void prepareUniformBuffers()
 	{
@@ -724,13 +848,30 @@ class VulkanExample : public VulkanExampleBase
 		memcpy(uniformBuffers[currentBuffer].mapped, &uniformData, sizeof(UniformData));
 	}
 
+	void prepareComputeBuffers()
+	{
+		// ----- Indirect commands buffer -----
+		const size_t indirectCommandsBufferSize = glTFModel.meshletIndices.count * sizeof(VkDrawIndexedIndirectCommand);
+
+		VK_CHECK_RESULT(vulkanDevice->createBuffer(
+		    VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		    &glTFModel.indirectCommandsBuffer,
+		    indirectCommandsBufferSize,
+		    nullptr));
+		vks::debugutils::setObjectName(vulkanDevice->logicalDevice, VK_OBJECT_TYPE_BUFFER, uint64_t(glTFModel.indirectCommandsBuffer.buffer), "Indirect commands buffer");
+	}
+
 	void prepare()
 	{
 		VulkanExampleBase::prepare();
 		loadAssets();
 		prepareUniformBuffers();
+		prepareComputeBuffers();
 		setupDescriptors();
+		setupComputeDescriptors();
 		preparePipelines();
+		prepareComputePipeline();
 		prepared = true;
 	}
 
@@ -756,6 +897,26 @@ class VulkanExample : public VulkanExampleBase
 		};
 
 		VK_CHECK_RESULT(vkBeginCommandBuffer(cmdBuffer, &cmdBufInfo));
+
+		if (selectedDrawModeGUI != int32_t(DrawMode::DRAW_INDEXED) && selectedDrawModeGUI != int32_t(DrawMode::DRAW_INDEXED_MESHLETS))
+		{
+			vkCmdBindDescriptorSets(cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayoutCompute, 0, 1, &computeDescriptorSet, 0, nullptr);
+			vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines.compute);
+			// Pass the total number of meshlets using push constants
+			const uint32_t allMeshletsDataCount = static_cast<uint32_t>(glTFModel.allMeshletsData.size());
+			vkCmdPushConstants(cmdBuffer, pipelineLayoutCompute, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &allMeshletsDataCount);
+			const uint32_t groupCountX = (allMeshletsDataCount + 63) / 64;
+			vkCmdDispatch(cmdBuffer, groupCountX, 1, 1);
+
+			// ----- BARRIER -----
+			VkMemoryBarrier barrier{};
+			barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+			barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+
+			vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+		}
+
 		vkCmdBeginRenderPass(cmdBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 		const VkViewport viewport = vks::initializers::viewport((float)width, (float)height, 0.0f, 1.0f);
 		vkCmdSetViewport(cmdBuffer, 0, 1, &viewport);
@@ -791,6 +952,9 @@ class VulkanExample : public VulkanExampleBase
 				break;
 			case KEY_F2:
 				selectedDrawModeGUI = 1;
+				break;
+			case KEY_F3:
+				selectedDrawModeGUI = 2;
 				break;
 		}
 	}

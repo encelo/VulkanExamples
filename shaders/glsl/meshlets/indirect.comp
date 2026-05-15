@@ -1,0 +1,50 @@
+#version 450
+
+struct Meshlet
+{
+	uint firstIndex;
+	uint indexCount;
+	float padding0;
+	float padding1;
+
+	vec3 center;
+	float radius;
+};
+
+struct IndirectCommand
+{
+	uint indexCount;
+	uint instanceCount;
+	uint firstIndex;
+	int vertexOffset;
+	uint firstInstance;
+};
+
+layout (local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer ssboIn {
+	Meshlet meshlets[ ];
+};
+
+layout(std430, set = 0, binding = 1) buffer ssboOut {
+	IndirectCommand indirectCmds[ ];
+};
+
+layout (push_constant) uniform PushConsts {
+	uint numMeshlets;
+} push;
+
+void main()
+{
+	if (gl_GlobalInvocationID.x >= push.numMeshlets)
+		return;
+
+	IndirectCommand cmd;
+	cmd.indexCount = meshlets[gl_GlobalInvocationID.x].indexCount;
+	cmd.instanceCount = 1;
+	cmd.firstIndex = meshlets[gl_GlobalInvocationID.x].firstIndex;
+	cmd.vertexOffset = 0;
+	cmd.firstInstance = 0;
+
+	indirectCmds[gl_GlobalInvocationID.x] = cmd;
+}
