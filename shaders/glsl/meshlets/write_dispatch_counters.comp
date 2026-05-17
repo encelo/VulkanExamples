@@ -1,0 +1,26 @@
+#version 460
+
+layout(local_size_x = 1) in;
+
+struct Counters
+{
+	uint meshletCountFromVisibleInstances;
+	uint visibleMeshletCount;
+
+	// DispatchIndirectCommand
+	uint dispatchX;
+	uint dispatchY;
+	uint dispatchZ;
+};
+
+layout(std430, binding = 0) buffer ssboOut0
+{
+	Counters counters;
+};
+
+void main()
+{
+	counters.dispatchX = (counters.meshletCountFromVisibleInstances + 63) / 64;
+	counters.dispatchY = 1;
+	counters.dispatchZ = 1;
+}

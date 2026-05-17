@@ -57,6 +57,9 @@ for root, dirs, files in os.walk(dir_path):
             if args.g:
                 add_params = "-g"
 
+            # Enable subgroup operations
+            if file.endswith(".comp"):
+                add_params = add_params + " --target-env spirv1.3"
             # Ray tracing shaders require a different target environment           
             if file.endswith(".rgen") or file.endswith(".rchit") or file.endswith(".rmiss"):
                add_params = add_params + " --target-env vulkan1.2"

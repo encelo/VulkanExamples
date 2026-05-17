@@ -1,0 +1,177 @@
+#version 460
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+
+struct Instance
+{
+	mat4 transform;
+	vec4 color;
+};
+
+struct Primitive
+{
+	uint firstMeshlet;
+	uint meshletCount;
+	float padding0;
+	float padding1;
+
+	mat4 transform;
+
+	vec3 center;
+	float radius;
+};
+
+struct Meshlet
+{
+	uint firstIndex;
+	uint indexCount;
+	float padding0;
+	float padding1;
+
+	vec3 center;
+	float radius;
+};
+
+struct Counters
+{
+	uint meshletCountFromVisibleInstances;
+	uint visibleMeshletCount;
+
+	// DispatchIndirectCommand
+	uint dispatchX;
+	uint dispatchY;
+	uint dispatchZ;
+};
+
+struct VisibleMeshlet
+{
+	uint instanceIndex;
+	uint primitiveIndex;
+	uint meshletIndex;
+	uint padding0;
+};
+
+struct IndirectCommand
+{
+	uint indexCount;
+	uint instanceCount;
+	uint firstIndex;
+	int vertexOffset;
+	uint firstInstance;
+};
+
+layout (local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer ssboIn0 {
+	Instance instances[ ];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer ssboIn1 {
+	Primitive primitives[ ];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer ssboIn2 {
+	Meshlet meshlets[ ];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer ssboIn3 {
+	VisibleMeshlet visMeshlets[ ];
+};
+
+layout(std430, set = 0, binding = 4) buffer ssboOut4 {
+	Counters counters;
+};
+
+layout(std430, set = 0, binding = 5) buffer ssboOut5 {
+	IndirectCommand indirectCmds[ ];
+};
+
+const uint FEATURE_CULL_PRIMITIVES = 1u << 0;
+const uint FEATURE_CULL_MESHLETS = 1u << 1;
+
+layout (std140, set = 1, binding = 0) uniform UBOScene
+{
+	mat4 projection;
+	mat4 view;
+
+	vec4 frustumPlanes[6];
+	vec4 frozenFrustumPlanes[6];
+
+	vec4 viewPos;
+	vec4 lightPos;
+
+	uint features;
+	uint padding0;
+	uint padding1;
+	uint padding2;
+} uboScene;
+
+uint sphereVisible(vec3 center, float radius)
+{
+	for (uint i = 0; i < 6; ++i)
+	{
+		vec4 plane = uboScene.frozenFrustumPlanes[i];
+		float d = dot(plane.xyz, center) + plane.w;
+		if (d < -radius)
+			return 0;
+	}
+
+	return 1;
+}
+
+void main()
+{
+	uint globalID = gl_GlobalInvocationID.x;
+	if (globalID >= counters.meshletCountFromVisibleInstances)
+		return;
+
+	VisibleMeshlet visibleMeshlet = visMeshlets[globalID];
+
+	uint meshletIndex = visibleMeshlet.meshletIndex;
+	uint instanceIndex = visibleMeshlet.instanceIndex;
+	uint primitiveIndex = visibleMeshlet.primitiveIndex;
+
+	Meshlet meshlet = meshlets[meshletIndex];
+	Instance instance = instances[instanceIndex];
+	Primitive primitive = primitives[primitiveIndex];
+
+	mat4 world = instance.transform * primitive.transform;
+	vec3 worldCenter = (world * vec4(meshlet.center, 1.0)).xyz;
+
+	float scaleX = length(world[0].xyz);
+	float scaleY = length(world[1].xyz);
+	float scaleZ = length(world[2].xyz);
+	float maxScale = max(max(scaleX, scaleY), scaleZ);
+
+	float worldRadius = meshlet.radius * maxScale;
+
+	// Frustum culling
+	bool cullMeshlets = (uboScene.features & FEATURE_CULL_MESHLETS) != 0u;
+	uint visible = cullMeshlets ? sphereVisible(worldCenter, worldRadius) : 1;
+
+	uint localIndex = subgroupExclusiveAdd(visible);
+	uint visibleCount = subgroupAdd(visible);
+
+	uint baseIndex = 0;
+	if (subgroupElect())
+	{
+		baseIndex = atomicAdd(counters.visibleMeshletCount, visibleCount);
+	}
+	baseIndex = subgroupBroadcastFirst(baseIndex);
+
+	if (visible != 0)
+	{
+		uint dstIndex = baseIndex + localIndex;
+
+		IndirectCommand cmd;
+		cmd.indexCount = meshlet.indexCount;
+		cmd.instanceCount = 1;
+		cmd.firstIndex = meshlet.firstIndex;
+		cmd.vertexOffset = 0;
+		cmd.firstInstance = globalID;
+
+		indirectCmds[dstIndex] = cmd;
+	}
+}

@@ -3,12 +3,21 @@
 layout (location = 0) in vec3 inPos;
 layout (location = 1) in vec3 inNormal;
 
-layout (set = 0, binding = 0) uniform UBOScene
+layout (std140, set = 0, binding = 0) uniform UBOScene
 {
 	mat4 projection;
 	mat4 view;
-	vec4 lightPos;
+
+	vec4 frustumPlanes[6];
+	vec4 frozenFrustumPlanes[6];
+
 	vec4 viewPos;
+	vec4 lightPos;
+
+	uint features;
+	uint padding0;
+	uint padding1;
+	uint padding2;
 } uboScene;
 
 layout (push_constant) uniform PushConsts {

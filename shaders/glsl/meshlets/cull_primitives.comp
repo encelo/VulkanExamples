@@ -1,0 +1,170 @@
+#version 460
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+
+struct Instance
+{
+	mat4 transform;
+	vec4 color;
+};
+
+struct Primitive
+{
+	uint firstMeshlet;
+	uint meshletCount;
+	float padding0;
+	float padding1;
+
+	mat4 transform;
+
+	vec3 center;
+	float radius;
+};
+
+struct Meshlet
+{
+	uint firstIndex;
+	uint indexCount;
+	float padding0;
+	float padding1;
+
+	vec3 center;
+	float radius;
+};
+
+struct Counters
+{
+	uint meshletCountFromVisibleInstances;
+	uint visibleMeshletCount;
+
+	// DispatchIndirectCommand
+	uint dispatchX;
+	uint dispatchY;
+	uint dispatchZ;
+};
+
+struct VisibleMeshlet
+{
+	uint instanceIndex;
+	uint primitiveIndex;
+	uint meshletIndex;
+	uint padding0;
+};
+
+layout (local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer ssboIn0 {
+	Instance instances[ ];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer ssboIn1 {
+	Primitive primitives[ ];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer ssboIn2 {
+	Meshlet meshlets[ ];
+};
+
+layout(std430, set = 0, binding = 3) buffer ssboOut3 {
+	Counters counters;
+};
+
+layout(std430, set = 0, binding = 4) writeonly buffer ssboOut4 {
+	VisibleMeshlet outMeshlets[ ];
+};
+
+const uint FEATURE_CULL_PRIMITIVES = 1u << 0;
+const uint FEATURE_CULL_MESHLETS = 1u << 1;
+
+layout (std140, set = 1, binding = 0) uniform UBOScene
+{
+	mat4 projection;
+	mat4 view;
+
+	vec4 frustumPlanes[6];
+	vec4 frozenFrustumPlanes[6];
+
+	vec4 viewPos;
+	vec4 lightPos;
+
+	uint features;
+	uint padding0;
+	uint padding1;
+	uint padding2;
+} uboScene;
+
+layout (push_constant) uniform PushConsts {
+	uint numInstances;
+	uint numPrimitives;
+} push;
+
+uint sphereVisible(vec3 center, float radius)
+{
+	for (uint i = 0; i < 6; ++i)
+	{
+		vec4 plane = uboScene.frozenFrustumPlanes[i];
+		float d = dot(plane.xyz, center) + plane.w;
+		if (d < -radius)
+			return 0;
+	}
+
+	return 1;
+}
+
+void main()
+{
+	// One invocation per primitive
+	uint globalID = gl_GlobalInvocationID.x;
+	uint totalInvocations = push.numInstances * push.numPrimitives;
+	if (globalID >= totalInvocations)
+		return;
+
+	uint instanceIndex = globalID / push.numPrimitives;
+	uint primitiveIndex = globalID % push.numPrimitives;
+
+	Instance instance = instances[instanceIndex];
+	Primitive primitive = primitives[primitiveIndex];
+
+	mat4 world = instance.transform * primitive.transform;
+	vec3 worldCenter = (world * vec4(primitive.center, 1.0)).xyz;
+
+	float scaleX = length(world[0].xyz);
+	float scaleY = length(world[1].xyz);
+	float scaleZ = length(world[2].xyz);
+	float maxScale = max(max(scaleX, scaleY), scaleZ);
+
+	float worldRadius = primitive.radius * maxScale;
+
+	// Frustum culling
+	bool cullPrimitives = (uboScene.features & FEATURE_CULL_PRIMITIVES) != 0u;
+	uint visible = cullPrimitives ? sphereVisible(worldCenter, worldRadius) : 1;
+
+	uint laneContribution = visible != 0 ? primitive.meshletCount : 0;
+	uint waveContribution = subgroupAdd(laneContribution);
+	uint localIndex = subgroupExclusiveAdd(laneContribution);
+
+	uint baseIndex = 0;
+	if (subgroupElect())
+	{
+		baseIndex = atomicAdd(counters.meshletCountFromVisibleInstances, waveContribution);
+	}
+	baseIndex = subgroupBroadcastFirst(baseIndex);
+
+	// Emit visible meshlets
+	if (visible != 0)
+	{
+		uint outMeshletIndex = baseIndex + localIndex;
+
+		for (uint i = 0; i < primitive.meshletCount; i++)
+		{
+			VisibleMeshlet vm;
+			vm.meshletIndex = primitive.firstMeshlet + i;
+			vm.instanceIndex = instanceIndex;
+			vm.primitiveIndex = primitiveIndex;
+
+			outMeshlets[outMeshletIndex + i] = vm;
+		}
+	}
+}
