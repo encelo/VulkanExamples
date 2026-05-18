@@ -39,6 +39,7 @@ struct Meshlet
 
 struct Counters
 {
+	uint visiblePrimitiveCount; // only used for statistics
 	uint meshletCountFromVisibleInstances;
 	uint visibleMeshletCount;
 

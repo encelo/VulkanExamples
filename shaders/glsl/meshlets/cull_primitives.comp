@@ -39,6 +39,7 @@ struct Meshlet
 
 struct Counters
 {
+	uint visiblePrimitiveCount; // only used for statistics
 	uint meshletCountFromVisibleInstances;
 	uint visibleMeshletCount;
 
@@ -150,10 +151,12 @@ void main()
 	uint laneContribution = visible != 0 ? primitive.meshletCount : 0;
 	uint waveContribution = subgroupAdd(laneContribution);
 	uint localIndex = subgroupExclusiveAdd(laneContribution);
+	uint visiblePrimitives = subgroupAdd(visible); // only used for statistics
 
 	uint baseIndex = 0;
 	if (subgroupElect())
 	{
+		atomicAdd(counters.visiblePrimitiveCount, visiblePrimitives);
 		baseIndex = atomicAdd(counters.meshletCountFromVisibleInstances, waveContribution);
 	}
 	baseIndex = subgroupBroadcastFirst(baseIndex);

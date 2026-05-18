@@ -52,6 +52,15 @@ const char *drawModeItemsGUI = "Indexed\0Indexed Meshlets\0Indirect Meshlets\0In
 float meshletsToRenderGUI = 1.0f;
 size_t renderedMeshletsCounterGUI = 0;
 
+enum class ColorMode : int32_t
+{
+	PER_INSTANCE,
+	PER_MESHLET
+};
+
+int32_t selectedColorModeGUI = int32_t(ColorMode::PER_INSTANCE);
+const char *colorModeItemsGUI = "Per Instance\0Per Meshlet\0\0";
+
 bool freezeCullingCameraGUI = false;
 bool cullPrimitivesGUI = true;
 bool cullMeshletsGUI = true;
@@ -61,11 +70,22 @@ enum FeatureFlags : uint32_t
 {
 	CullPrimitives = 1 << 0,
 	CullMeshlets = 1 << 1,
-	ConeCulling = 1 << 2
+	ConeCulling = 1 << 2,
+	MeshletColors = 1 << 3
 };
+
+enum class CameraMode : int32_t
+{
+	LOOK_AT,
+	FIRST_PERSON
+};
+
+int32_t selectedCameraModeGUI = int32_t(CameraMode::FIRST_PERSON);
+const char *cameraModeItemsGUI = "Look At\0First Person\0\0";
 
 struct Counters
 {
+	uint32_t visiblePrimitiveCount; // only used for statistics
 	uint32_t meshletCountFromVisibleInstances;
 	uint32_t visibleMeshletCount;
 
@@ -74,6 +94,8 @@ struct Counters
 	uint32_t dispatchY;
 	uint32_t dispatchZ;
 };
+
+Counters countersGUI;
 
 struct VisibleMeshlet
 {
@@ -114,6 +136,24 @@ Sphere mergeSpheres(const Sphere &a, const Sphere &b)
 	result.radius = glm::length(p1 - result.center);
 
 	return result;
+}
+
+uint32_t randomInteger(uint32_t &state)
+{
+	state = state * 1664525u + 1013904223u;
+	return state;
+}
+
+float randomFloat(uint32_t &state)
+{
+	return randomInteger(state) / float(UINT32_MAX);
+}
+
+glm::vec3 randomColor(uint32_t id)
+{
+	const float h = glm::fract(float(id) * 0.61803398875f);
+	const glm::vec3 rgb = glm::clamp(glm::abs(glm::mod(h * 6.0f + glm::vec3(0.0f, 4.0f, 2.0f), 6.0f) - 3.0f) - 1.0f, 0.0f, 1.0f);
+	return glm::mix(glm::vec3(1.0f), rgb, 0.7f);
 }
 
 }
@@ -474,6 +514,8 @@ class VulkanExample : public VulkanExampleBase
 
 	// The buffer containing various atomic counters
 	vks::Buffer countersBuffer;
+	// The readback buffers for the CPU to read the counters
+	std::array<vks::Buffer, maxConcurrentFrames> readbackBuffers;
 
 	// The buffer containing the meshlets from all instances
 	vks::Buffer instanceMeshletsBuffer;
@@ -550,10 +592,10 @@ class VulkanExample : public VulkanExampleBase
 		title = "Indirect meshlets rendering";
 		apiVersion = VK_API_VERSION_1_2;
 
-		camera.type = Camera::CameraType::lookat;
+		camera.type = Camera::CameraType::firstperson;
+		camera.setMovementSpeed(3.0f);
 		camera.flipY = true;
-		camera.setPosition(glm::vec3(0.0f, -0.1f, -1.0f));
-		camera.setRotation(glm::vec3(0.0f, 45.0f, 0.0f));
+		camera.setPosition(glm::vec3(0.0f, 0.0f, -5.0f));
 		camera.setPerspective(60.0f, (float)width / (float)height, 0.1f, 256.0f);
 
 		// Not checking for support
@@ -587,6 +629,11 @@ class VulkanExample : public VulkanExampleBase
 
 			instancesBuffer.destroy();
 			countersBuffer.destroy();
+			for (auto &buffer : readbackBuffers)
+			{
+				buffer.unmap();
+				buffer.destroy();
+			}
 			instanceMeshletsBuffer.destroy();
 			indirectCommandsBuffer.destroy();
 		}
@@ -624,8 +671,8 @@ class VulkanExample : public VulkanExampleBase
 		glTFModel.vulkanDevice = vulkanDevice;
 		glTFModel.copyQueue = queue;
 
-		std::vector<uint32_t> indexBuffer;
-		std::vector<VulkanglTFModel::Vertex> vertexBuffer;
+		std::vector<uint32_t> loadedIndexBuffer;
+		std::vector<VulkanglTFModel::Vertex> loadedVertexBuffer;
 
 		if (fileLoaded)
 		{
@@ -633,7 +680,7 @@ class VulkanExample : public VulkanExampleBase
 			for (size_t i = 0; i < scene.nodes.size(); i++)
 			{
 				const tinygltf::Node node = glTFInput.nodes[scene.nodes[i]];
-				glTFModel.loadNode(node, glTFInput, nullptr, indexBuffer, vertexBuffer);
+				glTFModel.loadNode(node, glTFInput, nullptr, loadedIndexBuffer, loadedVertexBuffer);
 			}
 		}
 		else
@@ -641,6 +688,19 @@ class VulkanExample : public VulkanExampleBase
 			vks::tools::exitFatal("Could not open the glTF file.\n\nMake sure the assets submodule has been checked out and is up-to-date.", -1);
 			return;
 		}
+
+		// ----- Optimize vertices and indices -----
+		std::vector<unsigned int> remap(loadedIndexBuffer.size());
+
+		size_t vertexCount = meshopt_generateVertexRemap(remap.data(), loadedIndexBuffer.data(), loadedIndexBuffer.size(), loadedVertexBuffer.data(), loadedVertexBuffer.size(), sizeof(VulkanglTFModel::Vertex));
+
+		std::vector<VulkanglTFModel::Vertex> vertexBuffer(vertexCount);
+		std::vector<uint32_t> indexBuffer(loadedIndexBuffer.size());
+
+		meshopt_remapVertexBuffer(vertexBuffer.data(), loadedVertexBuffer.data(), loadedVertexBuffer.size(), sizeof(VulkanglTFModel::Vertex), remap.data());
+		meshopt_remapIndexBuffer(indexBuffer.data(), loadedIndexBuffer.data(), loadedIndexBuffer.size(), remap.data());
+		meshopt_optimizeVertexCache(indexBuffer.data(), indexBuffer.data(), loadedIndexBuffer.size(), vertexCount);
+		meshopt_optimizeVertexFetch(vertexBuffer.data(), indexBuffer.data(), loadedIndexBuffer.size(), vertexBuffer.data(), vertexCount, sizeof(VulkanglTFModel::Vertex));
 
 		// Create and upload vertex and index buffer
 		// We will be using one single vertex buffer and one single index buffer for the whole glTF scene
@@ -900,41 +960,45 @@ class VulkanExample : public VulkanExampleBase
 
 	void loadAssets()
 	{
-		loadglTFFile(getAssetPath() + "models/FlightHelmet/glTF/FlightHelmet.gltf");
+		loadglTFFile(getAssetPath() + "models/chinesedragon.gltf");
 	}
 
 	void addInstances()
 	{
-		instances.reserve(16);
+		constexpr uint32_t Width = 7;
+		constexpr uint32_t Height = 7;
+		constexpr float Spacing = 2.75f;
 
-		glm::vec3 position(-1.0f, 0.0f, 0.0f);
-		const glm::vec3 scale(1.0f, 1.0f, 1.0f);
-		const float angle = glm::radians(180.0f);
-		const glm::vec3 axis(0.0f, 1.0f, 0.0f);
+		instances.clear();
+		instances.reserve(Width * Height);
 
-		Instance inst;
-		inst.transform = glm::mat4(1.0f);
-		inst.transform = glm::translate(inst.transform, position);
-		inst.transform = glm::rotate(inst.transform, angle, axis);
-		inst.transform = glm::scale(inst.transform, scale);
-		inst.color = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
-		instances.push_back(inst);
+		const float halfWidth = (Width - 1) * Spacing * 0.5f;
+		const float halfHeight = (Height - 1) * Spacing * 0.5f;
 
-		position = glm::vec3(0.0f, 0.0f, 0.0f);
-		inst.transform = glm::mat4(1.0f);
-		inst.transform = glm::translate(inst.transform, position);
-		inst.transform = glm::rotate(inst.transform, angle, axis);
-		inst.transform = glm::scale(inst.transform, scale);
-		inst.color = glm::vec4(0.0f, 1.0f, 0.0f, 1.0f);
-		instances.push_back(inst);
+		for (unsigned int y = 0; y < Height; y++)
+		{
+			for (unsigned int x = 0; x < Width; x++)
+			{
+				const uint32_t id = y * width + x;
+				uint32_t rng = id + 1337;
 
-		position = glm::vec3(1.0f, 0.0f, 0.0f);
-		inst.transform = glm::mat4(1.0f);
-		inst.transform = glm::translate(inst.transform, position);
-		inst.transform = glm::rotate(inst.transform, angle, axis);
-		inst.transform = glm::scale(inst.transform, scale);
-		inst.color = glm::vec4(0.0f, 0.0f, 1.0f, 1.0f);
-		instances.push_back(inst);
+				const glm::vec3 position(x * Spacing - halfWidth, y * Spacing - halfHeight, 0.0f);
+				const float rotY = glm::radians((randomFloat(rng) * 2.0f - 1.0f) * 10.0f);
+				const float rotX = glm::radians((randomFloat(rng) * 2.0f - 1.0f) * 3.0f);
+				const float rotZ = glm::radians((randomFloat(rng) * 2.0f - 1.0f) * 3.0f);
+
+				Instance inst;
+				inst.transform = glm::mat4(1.0f);
+				inst.transform = glm::translate(inst.transform, position);
+
+				inst.transform = glm::rotate(inst.transform, rotY, glm::vec3(0.0f, 1.0f, 0.0f));
+				inst.transform = glm::rotate(inst.transform, rotX, glm::vec3(1.0f, 0.0f, 0.0f));
+				inst.transform = glm::rotate(inst.transform, rotZ, glm::vec3(0.0f, 0.0f, 1.0f));
+
+				inst.color = glm::vec4(randomColor(id), 1.0f);
+				instances.push_back(inst);
+			}
+		}
 
 		assert(instances.size() <= MaxInstanceCount);
 	}
@@ -1382,6 +1446,8 @@ class VulkanExample : public VulkanExampleBase
 			uniformData.features |= FeatureFlags::CullMeshlets;
 		if (coneCullingGUI)
 			uniformData.features |= FeatureFlags::ConeCulling;
+		if (selectedColorModeGUI == uint32_t(ColorMode::PER_MESHLET))
+			uniformData.features |= FeatureFlags::MeshletColors;
 
 		memcpy(uniformBuffers[currentBuffer].mapped, &uniformData, sizeof(UniformData));
 	}
@@ -1428,13 +1494,28 @@ class VulkanExample : public VulkanExampleBase
 		const size_t countersBufferSize = sizeof(Counters);
 
 		VK_CHECK_RESULT(vulkanDevice->createBuffer(
-		    // Needs transfer destination usage so it can be cleared, and indirect usage as it also contains dispatch group counts
-		    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		    // Needs transfer destination usage so it can be cleared, transfer source to be read back, and indirect usage as it also contains dispatch group counts
+		    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 		    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 		    &countersBuffer,
 		    countersBufferSize,
 		    nullptr));
 		vks::debugutils::setObjectName(vulkanDevice->logicalDevice, VK_OBJECT_TYPE_BUFFER, uint64_t(countersBuffer.buffer), "Counters buffer");
+
+		// ----- Readback buffers -----
+		for (auto &buffer : readbackBuffers)
+		{
+			VK_CHECK_RESULT(vulkanDevice->createBuffer(
+				// Needs transfer destination usage so it can be cleared, and indirect usage as it also contains dispatch group counts
+				VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+				&buffer,
+				countersBufferSize,
+				nullptr));
+			// Persistent mapping
+			buffer.map();
+			vks::debugutils::setObjectName(vulkanDevice->logicalDevice, VK_OBJECT_TYPE_BUFFER, uint64_t(buffer.buffer), "Readback buffer");
+		}
 
 		// ----- Instance meshlets buffer -----
 		const size_t instanceMeshletsBufferSize = MaxMeshletCount * sizeof(VisibleMeshlet);
@@ -1599,6 +1680,28 @@ class VulkanExample : public VulkanExampleBase
 				vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 			}
 			// ----- -----
+
+			// ----- BARRIER -----
+			{
+				VkBufferMemoryBarrier barrier{};
+				barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+				barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+				barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+				barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+
+				barrier.buffer = countersBuffer.buffer;
+				barrier.offset = 0;
+				barrier.size = sizeof(Counters);
+
+				vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+			}
+			// ----- -----
+
+			// Readback the counters
+			VkBufferCopy copyRegion{ .size = sizeof(Counters) };
+			vkCmdCopyBuffer(cmdBuffer, countersBuffer.buffer, readbackBuffers[currentBuffer].buffer, 1, &copyRegion);
 		}
 
 		vkCmdBeginRenderPass(cmdBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
@@ -1638,6 +1741,9 @@ class VulkanExample : public VulkanExampleBase
 		updateUniformBuffers();
 		buildCommandBuffer();
 		VulkanExampleBase::submitFrame();
+
+		vks::Buffer &readbackBuffer = readbackBuffers[(currentBuffer + maxConcurrentFrames - 1) % maxConcurrentFrames];
+		countersGUI = *(static_cast<Counters *>(readbackBuffer.mapped));
 	}
 
 	virtual void keyPressed(uint32_t keyCode)
@@ -1668,16 +1774,17 @@ class VulkanExample : public VulkanExampleBase
 	{
 		if (overlay->header("Settings"))
 		{
-			if (ImGui::Button("Reset Camera"))
-			{
-				camera.setPosition(glm::vec3(0.0f, -0.1f, -1.0f));
-				camera.setRotation(glm::vec3(0.0f, 45.0f, 0.0f));
-				camera.setPerspective(60.0f, (float)width / (float)height, 0.1f, 256.0f);
-			}
-
-			ImGui::PushItemWidth(200.0f);
-			ImGui::Combo("Draw Mode", &selectedDrawModeGUI, drawModeItemsGUI);
+			ImGui::PushItemWidth(135.0f);
+			ImGui::Combo("Camera Mode", &selectedCameraModeGUI, cameraModeItemsGUI);
 			ImGui::PopItemWidth();
+			camera.type = Camera::CameraType(selectedCameraModeGUI);
+			ImGui::SameLine();
+			if (ImGui::Button("Reset"))
+			{
+				camera.setPosition(glm::vec3(0.0f, 0.0f, -5.0f));
+				camera.setRotation(glm::vec3(0.0f, 0.0f, 0.0f));
+				camera.viewPos = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+			}
 
 			if (selectedDrawModeGUI != int32_t(DrawMode::DRAW_INDIRECT_INSTANCED_MESHLETS))
 			{
@@ -1685,6 +1792,9 @@ class VulkanExample : public VulkanExampleBase
 					overlay->checkBox("Wireframe", &wireframe);
 			}
 
+			ImGui::PushItemWidth(200.0f);
+			ImGui::Combo("Draw Mode", &selectedDrawModeGUI, drawModeItemsGUI);
+			ImGui::PopItemWidth();
 			if (selectedDrawModeGUI == int32_t(DrawMode::DRAW_INDEXED_MESHLETS) ||
 			    selectedDrawModeGUI == int32_t(DrawMode::DRAW_INDIRECT_MESHLETS))
 			{
@@ -1697,10 +1807,25 @@ class VulkanExample : public VulkanExampleBase
 			}
 			else if (selectedDrawModeGUI == int32_t(DrawMode::DRAW_INDIRECT_INSTANCED_MESHLETS))
 			{
+				ImGui::PushItemWidth(200.0f);
+				ImGui::Combo("Color Mode", &selectedColorModeGUI, colorModeItemsGUI);
+				ImGui::PopItemWidth();
+
 				ImGui::Checkbox("Freeze Culling Camera", &freezeCullingCameraGUI);
 				ImGui::Checkbox("Cull Primitives", &cullPrimitivesGUI);
 				ImGui::Checkbox("Cull Meshlets", &cullMeshletsGUI);
 				ImGui::Checkbox("Cone Culling", &coneCullingGUI);
+
+				ImGui::NewLine();
+				char overlayString[64];
+				const uint32_t allPrimitivesCount = instances.size() * glTFModel.allPrimitivesData.size();
+				const float fractionPrimitives = float(countersGUI.visiblePrimitiveCount) / float(allPrimitivesCount);
+				snprintf(overlayString, 64, "%u visible / %u total primitives", countersGUI.visiblePrimitiveCount, allPrimitivesCount);
+				ImGui::ProgressBar(fractionPrimitives, ImVec2(-1, 0), overlayString);
+
+				const float fractionMeshlets = float(countersGUI.visibleMeshletCount) / float(countersGUI.meshletCountFromVisibleInstances);
+				snprintf(overlayString, 64, "%u visible / %u total meshlets", countersGUI.visibleMeshletCount, countersGUI.meshletCountFromVisibleInstances);
+				ImGui::ProgressBar(fractionMeshlets, ImVec2(-1, 0), overlayString);
 			}
 		}
 	}

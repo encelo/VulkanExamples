@@ -45,6 +45,8 @@ struct VisibleMeshlet
 layout (location = 0) in vec3 inPos;
 layout (location = 1) in vec3 inNormal;
 
+const uint FEATURE_MESHLET_COLORS = 1u << 3;
+
 layout (std140, set = 0, binding = 0) uniform UBOScene
 {
 	mat4 projection;
@@ -85,13 +87,22 @@ layout (location = 1) out vec3 outNormal;
 layout (location = 2) out vec3 outViewVec;
 layout (location = 3) out vec3 outLightVec;
 
+vec3 randomColor(uint id)
+{
+	float h = fract(float(id) * 0.61803398875);
+	vec3 rgb = clamp(abs(mod(h * 6.0 + vec3(0, 4, 2), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+	return mix(vec3(1.0), rgb, 0.7);
+}
+
 void main()
 {
 	VisibleMeshlet visMeshlet = visMeshlets[gl_BaseInstance];
 	Instance instance = instances[visMeshlet.instanceIndex];
 	Primitive primitive = primitives[visMeshlet.primitiveIndex];
 
-	outColor = instance.color;
+	bool meshletColors = (uboScene.features & FEATURE_MESHLET_COLORS) != 0u;
+	outColor = meshletColors ? vec4(randomColor(visMeshlet.meshletIndex), 1.0) : instance.color;
+
 	outNormal = inNormal;
 	mat4 world = instance.transform * primitive.transform;
 	gl_Position = uboScene.projection * uboScene.view * world * vec4(inPos, 1.0);
