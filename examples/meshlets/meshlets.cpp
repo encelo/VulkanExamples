@@ -55,11 +55,13 @@ size_t renderedMeshletsCounterGUI = 0;
 bool freezeCullingCameraGUI = false;
 bool cullPrimitivesGUI = true;
 bool cullMeshletsGUI = true;
+bool coneCullingGUI = true;
 
 enum FeatureFlags : uint32_t
 {
 	CullPrimitives = 1 << 0,
-	CullMeshlets = 1 << 1
+	CullMeshlets = 1 << 1,
+	ConeCulling = 1 << 2
 };
 
 struct Counters
@@ -168,6 +170,9 @@ class VulkanglTFModel
 
 		glm::vec3 center;
 		float radius;
+
+		glm::vec3 coneAxis;
+		float coneCutoff;
 	};
 
 	// A primitive contains the data for a single draw call
@@ -485,6 +490,8 @@ class VulkanExample : public VulkanExampleBase
 		glm::vec4 frozenFrustumPlanes[6];
 
 		glm::vec4 viewPos;
+		glm::vec4 frozenViewPos;
+
 		glm::vec4 lightPos = glm::vec4(5.0f, 5.0f, -5.0f, 1.0f);
 
 		uint32_t features;
@@ -665,7 +672,7 @@ class VulkanExample : public VulkanExampleBase
 					VulkanglTFModel::Primitive &primitive = node->mesh.primitives[primitiveIdx];
 					const size_t MaxVertices = 64;
 					const size_t MaxTriangles = 126;
-					const float ConeWeight = 0.0f;
+					const float ConeWeight = 0.25f;
 
 					size_t maxMeshlets = meshopt_buildMeshletsBound(primitive.indexCount, MaxVertices, MaxTriangles);
 					std::vector<meshopt_Meshlet> meshlets(maxMeshlets);
@@ -701,6 +708,9 @@ class VulkanExample : public VulkanExampleBase
 						meshlet.indexCount = m.triangle_count * 3;
 						meshlet.center = { bounds.center[0], bounds.center[1], bounds.center[2] };
 						meshlet.radius = bounds.radius;
+						meshlet.coneAxis = { bounds.cone_axis[0], bounds.cone_axis[1], bounds.cone_axis[2] };
+						meshlet.coneCutoff = bounds.cone_cutoff;
+
 						// All meshlets from all primitives of all nodes
 						glTFModel.allMeshletsData.push_back(meshlet);
 
@@ -1360,6 +1370,7 @@ class VulkanExample : public VulkanExampleBase
 
 		if (freezeCullingCameraGUI == false)
 		{
+			uniformData.frozenViewPos = uniformData.viewPos;
 			for (int i = 0; i < 6; ++i)
 				uniformData.frozenFrustumPlanes[i] = uniformData.frustumPlanes[i];
 		}
@@ -1369,6 +1380,8 @@ class VulkanExample : public VulkanExampleBase
 			uniformData.features |= FeatureFlags::CullPrimitives;
 		if (cullMeshletsGUI)
 			uniformData.features |= FeatureFlags::CullMeshlets;
+		if (coneCullingGUI)
+			uniformData.features |= FeatureFlags::ConeCulling;
 
 		memcpy(uniformBuffers[currentBuffer].mapped, &uniformData, sizeof(UniformData));
 	}
@@ -1687,6 +1700,7 @@ class VulkanExample : public VulkanExampleBase
 				ImGui::Checkbox("Freeze Culling Camera", &freezeCullingCameraGUI);
 				ImGui::Checkbox("Cull Primitives", &cullPrimitivesGUI);
 				ImGui::Checkbox("Cull Meshlets", &cullMeshletsGUI);
+				ImGui::Checkbox("Cone Culling", &coneCullingGUI);
 			}
 		}
 	}

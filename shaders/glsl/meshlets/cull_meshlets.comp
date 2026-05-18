@@ -32,6 +32,9 @@ struct Meshlet
 
 	vec3 center;
 	float radius;
+
+	vec3 coneAxis;
+	float coneCutoff;
 };
 
 struct Counters
@@ -90,6 +93,7 @@ layout(std430, set = 0, binding = 5) buffer ssboOut5 {
 
 const uint FEATURE_CULL_PRIMITIVES = 1u << 0;
 const uint FEATURE_CULL_MESHLETS = 1u << 1;
+const uint FEATURE_CONE_CULLING = 1u << 2;
 
 layout (std140, set = 1, binding = 0) uniform UBOScene
 {
@@ -100,6 +104,8 @@ layout (std140, set = 1, binding = 0) uniform UBOScene
 	vec4 frozenFrustumPlanes[6];
 
 	vec4 viewPos;
+	vec4 frozenViewPos;
+
 	vec4 lightPos;
 
 	uint features;
@@ -150,6 +156,16 @@ void main()
 	// Frustum culling
 	bool cullMeshlets = (uboScene.features & FEATURE_CULL_MESHLETS) != 0u;
 	uint visible = cullMeshlets ? sphereVisible(worldCenter, worldRadius) : 1;
+
+	// Cone culling
+	bool coneCulling = (uboScene.features & FEATURE_CONE_CULLING) != 0u;
+	if (visible != 0 && coneCulling)
+	{
+		vec3 worldConeAxis = (world * vec4(meshlet.coneAxis, 0.0)).xyz;
+		worldConeAxis = normalize(worldConeAxis);
+		vec3 viewDir = normalize(worldCenter - uboScene.frozenViewPos.xyz);
+		visible = dot(viewDir, worldConeAxis) >= meshlet.coneCutoff ? 0 : 1;
+	}
 
 	uint localIndex = subgroupExclusiveAdd(visible);
 	uint visibleCount = subgroupAdd(visible);

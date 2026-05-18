@@ -29,6 +29,9 @@ struct Meshlet
 
 	vec3 center;
 	float radius;
+
+	vec3 coneAxis;
+	float coneCutoff;
 };
 
 struct VisibleMeshlet
@@ -51,6 +54,8 @@ layout (std140, set = 0, binding = 0) uniform UBOScene
 	vec4 frozenFrustumPlanes[6];
 
 	vec4 viewPos;
+	vec4 frozenViewPos;
+
 	vec4 lightPos;
 
 	uint features;
