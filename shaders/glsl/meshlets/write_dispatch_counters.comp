@@ -1,5 +1,7 @@
 #version 460
 
+#extension GL_KHR_shader_subgroup_basic : enable
+
 layout(local_size_x = 1) in;
 
 struct Counters
@@ -7,6 +9,7 @@ struct Counters
 	uint visiblePrimitiveCount; // only used for statistics
 	uint meshletCountFromVisibleInstances;
 	uint visibleMeshletCount;
+	uint visibleIndicesCount;
 
 	// DispatchIndirectCommand
 	uint dispatchX;
@@ -19,9 +22,17 @@ layout(std430, binding = 0) buffer ssboOut0
 	Counters counters;
 };
 
+layout (push_constant) uniform PushConsts {
+	uint useVisibleMeshlets;
+} push;
+
 void main()
 {
-	counters.dispatchX = (counters.meshletCountFromVisibleInstances + 63) / 64;
+	if (push.useVisibleMeshlets == 0)
+		counters.dispatchX = (counters.meshletCountFromVisibleInstances + 63) / 64;
+	else
+		counters.dispatchX = (counters.visibleMeshletCount * gl_SubgroupSize + 63) / 64;
+
 	counters.dispatchY = 1;
 	counters.dispatchZ = 1;
 }

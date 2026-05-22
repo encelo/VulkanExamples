@@ -42,6 +42,7 @@ struct Counters
 	uint visiblePrimitiveCount; // only used for statistics
 	uint meshletCountFromVisibleInstances;
 	uint visibleMeshletCount;
+	uint visibleIndicesCount;
 
 	// DispatchIndirectCommand
 	uint dispatchX;

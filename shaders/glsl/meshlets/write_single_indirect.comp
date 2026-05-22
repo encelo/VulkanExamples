@@ -1,0 +1,46 @@
+#version 460
+
+layout(local_size_x = 1) in;
+
+struct Counters
+{
+	uint visiblePrimitiveCount; // only used for statistics
+	uint meshletCountFromVisibleInstances;
+	uint visibleMeshletCount;
+	uint visibleIndicesCount;
+
+	// DispatchIndirectCommand
+	uint dispatchX;
+	uint dispatchY;
+	uint dispatchZ;
+};
+
+struct IndirectCommand
+{
+	uint indexCount;
+	uint instanceCount;
+	uint firstIndex;
+	int vertexOffset;
+	uint firstInstance;
+};
+
+layout(std430, binding = 0) readonly buffer ssboIn0
+{
+	Counters counters;
+};
+
+layout(std430, set = 0, binding = 1) buffer ssboOut1 {
+	IndirectCommand indirectCmds[ ];
+};
+
+void main()
+{
+	IndirectCommand cmd;
+	cmd.indexCount = counters.visibleIndicesCount;
+	cmd.instanceCount = 1;
+	cmd.firstIndex = 0;
+	cmd.vertexOffset = 0;
+	cmd.firstInstance = 0;
+
+	indirectCmds[0] = cmd;
+}

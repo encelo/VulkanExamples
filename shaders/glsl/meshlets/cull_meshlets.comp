@@ -42,6 +42,7 @@ struct Counters
 	uint visiblePrimitiveCount; // only used for statistics
 	uint meshletCountFromVisibleInstances;
 	uint visibleMeshletCount;
+	uint visibleIndicesCount;
 
 	// DispatchIndirectCommand
 	uint dispatchX;
@@ -95,6 +96,7 @@ layout(std430, set = 0, binding = 5) buffer ssboOut5 {
 const uint FEATURE_CULL_PRIMITIVES = 1u << 0;
 const uint FEATURE_CULL_MESHLETS = 1u << 1;
 const uint FEATURE_CONE_CULLING = 1u << 2;
+const uint FEATURE_NO_MDI_MODE = 1u << 4;
 
 layout (std140, set = 1, binding = 0) uniform UBOScene
 {
@@ -178,16 +180,28 @@ void main()
 	}
 	baseIndex = subgroupBroadcastFirst(baseIndex);
 
+	// No-MDI Mode (recycling indirect command fields for index lookup buffer)
+	bool noMDIMode = (uboScene.features & FEATURE_NO_MDI_MODE) != 0u;
+
 	if (visible != 0)
 	{
 		uint dstIndex = baseIndex + localIndex;
 
 		IndirectCommand cmd;
 		cmd.indexCount = meshlet.indexCount;
-		cmd.instanceCount = 1;
 		cmd.firstIndex = meshlet.firstIndex;
-		cmd.vertexOffset = 0;
-		cmd.firstInstance = globalID;
+		if (noMDIMode)
+		{
+			cmd.instanceCount = instanceIndex;
+			cmd.vertexOffset = int(primitiveIndex);
+			cmd.firstInstance = meshletIndex;
+		}
+		else
+		{
+			cmd.instanceCount = 1;
+			cmd.vertexOffset = 0;
+			cmd.firstInstance = globalID;
+		}
 
 		indirectCmds[dstIndex] = cmd;
 	}

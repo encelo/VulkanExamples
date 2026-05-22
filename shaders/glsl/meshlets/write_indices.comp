@@ -1,0 +1,82 @@
+#version 460
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+
+layout (local_size_x = 64) in;
+
+struct Counters
+{
+	uint visiblePrimitiveCount; // only used for statistics
+	uint meshletCountFromVisibleInstances;
+	uint visibleMeshletCount;
+	uint visibleIndicesCount;
+
+	// DispatchIndirectCommand
+	uint dispatchX;
+	uint dispatchY;
+	uint dispatchZ;
+};
+
+struct IndirectCommand
+{
+	uint indexCount;
+	uint instanceCount;
+	uint firstIndex;
+	int vertexOffset;
+	uint firstInstance;
+};
+
+struct IndexLookupData
+{
+	uint instanceIndex;
+	uint primitiveIndex;
+	uint meshletIndex;
+	uint sourceIndex;
+};
+
+layout(std430, binding = 0) buffer ssboIn0
+{
+	Counters counters;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer ssboIn1 {
+	IndirectCommand indirectCmds[ ];
+};
+
+layout(std430, set = 0, binding = 2) buffer ssboOut2 {
+	uint indicesOut[ ];
+};
+
+layout(std430, set = 0, binding = 3) buffer ssboOut3 {
+	IndexLookupData indexLookupOut[ ];
+};
+
+void main()
+{
+	uint meshletIndex = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+	if (meshletIndex >= counters.visibleMeshletCount)
+		return;
+
+	IndirectCommand cmd = indirectCmds[meshletIndex];
+
+	uint baseIndex = 0;
+	if (subgroupElect())
+	{
+		baseIndex = atomicAdd(counters.visibleIndicesCount, cmd.indexCount);
+	}
+	baseIndex = subgroupBroadcastFirst(baseIndex);
+
+	for (uint i = gl_SubgroupInvocationID ; i < cmd.indexCount; i += gl_SubgroupSize)
+	{
+		indicesOut[baseIndex + i] = baseIndex + i;
+
+		IndexLookupData indexLookup;
+		indexLookup.instanceIndex = cmd.instanceCount;
+		indexLookup.primitiveIndex = cmd.vertexOffset;
+		indexLookup.meshletIndex = cmd.firstInstance;
+		indexLookup.sourceIndex = cmd.firstIndex + i;
+		indexLookupOut[baseIndex + i] = indexLookup;
+	}
+}
